@@ -32,37 +32,61 @@ labels = atlas["labels"]
 
 data = nilearn.datasets.fetch_development_fmri(data_dir=data_dir)
 
-n_subjects = 30
+class fMRIDataset(torch.utils.data.Dataset):
+    def __init__(self, img_dir, labels_file=None, transform=None, target_transform=None):
+        if labels_file is not None:
+            self.img_labels = pd.read_csv(labels_file) 
+        else:
+            self.img_labels = None
+        self.img_dir = img_dir
+        self.img_files = [name for name in os.listdir(img_dir) if (os.path.isfile(os.path.join(img_dir, name)) and name.endswith('.gz'))]
+        self.transform = transform
+        self.target_transform = target_transform
+    
+    def __len__(self):
+        return len(self.img_files)
+    
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.img_files[idx])
+        image = nilearn.image.get_data(img_path)
+        if self.img_labels is not None:
+            label = self.img_labels.iloc[idx, 1]
+            if self.target_transform:
+                label = self.target_transform(label)
+        else:
+            label = np.array([]) 
+        if self.transform:
+            image = self.transform(image)
+        else:
+            image = torch.tensor(image)
+        return image, label
 
-df_list = list()
-masked_list = list()
-affine_list = list()
-for subj_idx in range(n_subjects):
-    df_temp = nilearn.image.get_data(data.func[subj_idx])
-    df_affine = nib.load(data.func[subj_idx]).affine
+development_fmri = fMRIDataset(img_dir="data/development_fmri/development_fmri")
+batch_size = 5
+test_split = 0.2
+shuffle_dataset = True
+random_seed = 42
 
-    df_list.append(df_temp)
-    affine_list.append(df_affine)
+dataset_size = len(development_fmri)
+indices = list(range(dataset_size))
+split = int(np.floor(test_split * dataset_size))
+if shuffle_dataset:
+    np.random.seed(random_seed)
+    np.random.shuffle(indices)
+train_indices, test_indices = indices[split:], indices[:split]
 
-    masker = NiftiMasker(mask_strategy="whole-brain-template")
-    masker.fit(data.func[subj_idx])
-    fmri_masked = masker.transform(data.func[subj_idx])
-    masked_list.append(fmri_masked)
-
-dfs = np.array(df_list)
-masked = np.array(masked_list)
-
-df_train = torch.tensor(dfs[0:20])
-df_test = torch.tensor(dfs[21:30])
+train_sampler = torch.utils.data.sampler.SubsetRandomSampler(train_indices)
+test_sampler = torch.utils.data.sampler.SubsetRandomSampler(test_indices)
 
 train_loader = torch.utils.data.DataLoader(
-    df_train,
-    batch_size=10,
-    shuffle=True
+    development_fmri,
+    batch_size=batch_size,
+    sampler=train_sampler
 )
 test_loader = torch.utils.data.DataLoader(
-    df_test,
-    batch_size=batch_size
+    development_fmri,
+    batch_size=batch_size,
+    sampler=test_sampler
 )
 
 @dataclass
@@ -81,25 +105,25 @@ class DVAE(nn.Module):
         super(DVAE, self).__init__()
         self.encoder = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(input_size, 256),
+            nn.Linear(input_size, hidden_dim),
             nn.Tanh(),
-            nn.Linear(256, 128),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.Tanh(),
-            nn.Linear(128, 80),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
             nn.Tanh(),
-            nn.Linear(80, 2 * latent_dim),
+            nn.Linear(hidden_dim // 4, 2 * latent_dim),
         )
 
         self.softplus = nn.Softplus()
 
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 80),
+            nn.Linear(latent_dim, hidden_dim // 4),
             nn.Tanh(),
-            nn.Linear(80, 128),
+            nn.Linear(hidden_dim // 4, hidden_dim // 2),
             nn.Tanh(),
-            nn.Linear(128, 256),
+            nn.Linear(hidden_dim // 2, hidden_dim),
             nn.Tanh(),
-            nn.Linear(256, input_size),
+            nn.Linear(hidden_dim, input_size),
             nn.Sigmoid(),
             nn.Unflatten(1, input_dim),
         )
@@ -215,13 +239,13 @@ def test(model, dataloader, cur_step, writer=None):
         writer.add_images('Test/Samples', samples, global_step=cur_step)
 
 
-input_dim = df_train.shape[1:5]
-input_size = input_dim[1] * input_dim[2] * input_dim[3] * input_dim[4]
+input_dim = next(iter(train_loader))[0].shape[1:5]
+input_size = input_dim[0] * input_dim[1] * input_dim[2] * input_dim[3]
 learning_rate = 1e-3
 weight_decay = 1e-2
 num_epochs = 50
 latent_dim = 2
-hidden_dim = 512
+hidden_dim = 32
 
 model = DVAE(input_dim=input_dim, input_size=input_size, hidden_dim=hidden_dim, latent_dim=latent_dim)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
